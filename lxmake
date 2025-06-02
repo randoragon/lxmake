@@ -1,0 +1,238 @@
+#!/bin/sh -e
+
+# LaTeX make - a script for converting a LaTeX document to PDF in a contained
+# way, without any of the aux files junk.
+
+notif_id=
+
+# Determine if running in interactive shell or headless
+interactive=
+[ -t 0 ] && interactive=1
+
+error () {
+    [ -n "$interactive" ] && {
+        tput bold setaf 0 setab 15
+        echo "$*" >&2
+        tput sgr0
+    } || {
+        notify-send -u critical lxmake "$*"
+    }
+}
+
+help () {
+    echo 'Usage:'
+    echo '  lxmake [-d DIR] [-m] INPUT [OUTPUT]'
+    echo
+    echo "If either INPUT or OUTPUT are '-', they are interpreted as stdin/stdout"
+    echo "respectively. If INPUT is '-' and OUTPUT is not specified, '-' is assumed."
+    echo
+    echo 'The -d DIR option can be set to use DIR as the build directory, instead of'
+    echo 'creating a temporary one. This is helpful if you want the files to remain and'
+    echo 'potentially speed up the next build. This option is mutually exclusive with'
+    echo 'printing OUTPUT to stdout.'
+    echo
+    echo 'The -m option can be passed when INPUT is a subfile of a main document,'
+    echo 'and it will cause the script to compile that main document instead.'
+}
+
+cleanup () {
+    [ -f "$tinput" ] && shred -u -- "$tinput"
+    [ -f "$graphnames" ] && shred -u -- "$graphnames"
+    [ -f "$mockmain" ] && shred -u -- "$mockmain"
+    [ -z "$d_dir" ] && [ -d "$dir" ] && {
+        find "$dir" -type f -exec shred -u '{}' \;
+        rm -rf -- "$dir"
+    }
+}
+unset tinput dir d_dir graphnames mockmain compile_main use_biblatex
+trap cleanup EXIT INT TERM
+
+# Parse command-line arguments
+d_dir=
+OPTS="$(getopt -n lxmake -s sh -o hmd: -l help -- "$@")"
+eval set -- "$OPTS"
+while true; do
+    case "$1" in
+        -h|--help) help ; exit ;;
+        -d)
+            [ ! -d "$2" ] && printf "lxmake: '%s' is not a directory. Try 'lxmake --help' for more information.\n" "$2" >&2 && exit 4
+            d_dir="$2"
+            shift 2 ;;
+        -m) compile_main=1 ; shift ;;
+        --) shift ; break ;;
+        *) break ;;
+    esac
+done
+[ $# -lt 1 ] && echo "lxmake: not enough arguments. Try 'lxmake --help' for more information." >&2 && exit 3
+input="$1"
+output="$2"
+
+# If -m was passed, assume input is a subfile and compile the main document
+[ -n "$compile_main" ] && {
+    maintex="$(grep -o '^\\documentclass\[.*\]{subfiles}' "$input")"
+    maintex="${maintex##*[}"
+    maintex="${maintex%]*}"
+    inputdir="$(dirname -- "$input")"
+    [ -z "$maintex" ] || [ ! -f "$inputdir/$maintex" ] && {
+        notify-send lxmake "Main file not found: '$maintex'"
+        exit 10
+    }
+    input="$inputdir/$maintex"
+}
+
+
+# Validate input and output, store input in a temporary file, set inputdir
+[ "$input" != '-' ] && [ ! -r "$input" ] && echo 'lxmake: failed to read input file' >&2 && exit 1
+tinput="$(mktemp --tmpdir lxmake.XXXXX)"
+if [ "$input" = '-' ]; then
+    [ -z "$output" ] && output=-
+    cat - >"$tinput"
+    inputdir="$PWD"
+else
+    [ -n "$output" ] && [ "$output" != '-' ] && output="$(realpath -- "$output")"
+    inputdir="$(dirname -- "$input")"
+    cd -- "$inputdir" || { printf 'lxmake: failed to cd into "%s"' "$inputdir" >&2 && exit 9; }
+    input="$(basename -- "$input")"
+    [ -z "$output" ] && output="${input%.*}.pdf"
+    cp -- "$input" "$tinput"
+
+fi
+unset input # no longer needed
+[ ! -s "$tinput" ] && echo 'lxmake: no input provided' >&2 && exit 2
+[ "$output" = '-' ] && [ -n "$d_dir" ] && {
+    echo 'lxmake: specify output filename or drop -d (mutually exclusive)' >&2
+    exit 5
+}
+
+# Check if biblatex is enabled
+grep -q '^\\usepackage\(\[.*\]\)\?{biblatex}' "$tinput" && {
+    use_biblatex=1
+
+    # Rewrite addbibresource paths to be absolute
+    sed -i "s^\\\\addbibresource{\([^/].*\)}\\\\addbibresource{$(realpath -- "$inputdir")/\1}" "$tinput"
+}
+unset inputdir # no longer needed
+
+# compile <dir> <jobname> (jobname is extensionless output filename)
+compile () {
+    [ ! -d "$1" ] && printf 'not a directory: %s\n' "$1" >&2 && exit 6
+    xelatex -interaction batchmode -8bit -shell-escape -output-directory "$1" -jobname "$2" -- "$tinput" >&2
+}
+
+# The graphviz package correctly creates *.dot files in '-output-dir',
+# but for some reason it does not respect '-output-dir' on the second
+# run when embedding the graphs in the document. Instead, it always
+# expects those *.dot files to reside in the current working directory.
+# I found no workaround, so we must comply with this restriction.
+# Fortunately, the 'singlefile' package option lets us interact with
+# a gvpr script that generates those *.dot files, which makes it easy
+# to ensure their proper location, run safety checks (to ensure that no
+# third-party files are carelessly overwritten) and clean everything
+# up after compilation.
+# THE GRAPHVIZ PACKAGE MUST BE LOADED WITH 'singlefile' ENABLED!
+graphviz_setup() {
+    [ ! -f "$1/tmpmaster.gvpr" ] || [ ! -f "$1/tmpmaster.graphviz" ] && {
+        # No graphs were output -- either the package is improperly loaded
+        # (user might've forgotten the 'singlefile' option), or simply there
+        # are no graphs to display.
+        return
+    }
+    while read -r graph; do
+        graph="${graph#*\"}"
+        graph="${graph%%\"*}"
+        grep -qF "$graph" "$graphnames" && continue
+
+        # Ensure no pre-existing files are overwritten
+        for culprit in "$PWD/$graph".dot "$PWD/$graph".pdf; do
+            [ -e "$culprit" ] && {
+                error "Graph name collision: $culprit"
+                exit 8
+            }
+        done
+
+        echo "$graph" >>"$graphnames"
+    done <"$1/tmpmaster.gvpr"
+    gvpr -f "$1/tmpmaster.gvpr" "$1/tmpmaster.graphviz"
+}
+graphviz_cleanup() {
+    while read -r fname; do
+        rm -f -- "$fname.dot" "$fname.pdf"
+    done <"$graphnames"
+    rm -f -- "$dir/tmpmaster.gvpr" "$dir/tmpmaster.graphviz"
+    :>"$graphnames"
+}
+
+# Determine output directory and jobname
+if [ -z "$d_dir" ]; then
+    dir="$(mktemp --tmpdir -d lxmake.XXXXX.d)"
+    jobname=lxmake
+else
+    dir="$d_dir"
+    jobname="${output##*/}"
+    jobname="${jobname%.*}"
+fi
+
+# Ensure the tmpmaster files won't overwrite pre-existing files
+for culprit in "$dir/tmpmaster.gvpr" "$dir/tmpmaster.graphviz"; do
+    [ -e "$culprit" ] && {
+        error "tmpmaster file collision: $culprit"
+        exit 7
+    }
+done
+
+# Copy bibtex file to the output directory
+[ -n "$use_biblatex" ] && [ -f "$bibfile" ] && cp -- "$bibfile" "$dir/$jobname.bib"
+
+# Compile
+[ -n "$interactive" ] && {
+    printf '%s COMPILING 1/3 %s -output-dir=%s -jobname=%s\n' "$(tput bold setaf 0 setab 15)" "$(tput sgr0)" "$dir" "$jobname" >&2
+} || {
+    notif_id="$(notify-send -u low -t 999999 -p lxmake "compiling 1/3...")"
+}
+compile "$dir" "$jobname"
+# The document is compiled once if a "\nofiles" line is found...
+grep -q '^\\nofiles\b' "$tinput" || {
+    # ...otherwise it is compiled thrice if biblatex is used...
+    [ -n "$use_biblatex" ] && {
+        ls -a -- "$dir"
+        [ -n "$interactive" ] && {
+            printf '%s RUNNING BIBER %s -output-dir=%s -jobname=%s\n' "$(tput bold setaf 0 setab 15)" "$(tput sgr0)" "$dir" "$jobname" >&2
+        } || {
+            notify-send -u low -t 999999 -r $notif_id lxmake "running biber..."
+        }
+        biber --output-directory "$dir" -- "$jobname"
+    }
+    [ -n "$interactive" ] && {
+        printf '%s COMPILING 2/3 %s -output-dir=%s -jobname=%s\n' "$(tput bold setaf 0 setab 15)" "$(tput sgr0)" "$dir" "$jobname" >&2
+    } || {
+        notify-send -u low -t 999999 -r $notif_id lxmake "compiling 2/3..."
+    }
+    # ...otherwise it is compiled two times.
+    compile "$dir" "$jobname"
+    graphnames="$(mktemp --tmpdir lxmake.graphs.XXXXX)"
+    graphviz_setup "$dir"
+    [ -n "$interactive" ] && {
+        printf '%s COMPILING 3/3 %s -output-dir=%s -jobname=%s\n' "$(tput bold setaf 0 setab 15)" "$(tput sgr0)" "$dir" "$jobname" >&2
+    } || {
+        notify-send -u low -t 999999 -r $notif_id lxmake "compiling 3/3..."
+    }
+    compile "$dir" "$jobname"
+    graphviz_cleanup
+}
+
+# Restore main tex file to its original form, if necessary
+[ -n "$maintex" ] && [ -n "$maintex_orig" ] && {
+    printf '%s' "$maintex_orig" >"$maintex"
+}
+
+# Export the result PDF file
+if [ "$output" = '-' ]; then
+    cat -- "$dir/lxmake.pdf"
+    shred -u -- "$dir/lxmake.pdf"
+elif [ -f "$dir/$jobname.pdf" ] && [ "$output" != "$dir/$jobname.pdf" ]; then
+    mv -- "$dir/$jobname.pdf" "$output"
+fi
+
+[ -z "$interactive" ] && makoctl dismiss -n $notif_id
+
+true
