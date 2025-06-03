@@ -1,5 +1,5 @@
 {
-  description = "A shell script for building XeLaTeX documents.";
+  description = "A shell script for building XeLaTeX documents";
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   };
