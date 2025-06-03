@@ -10,6 +10,7 @@
       pkgsFor = nixpkgs.legacyPackages;
       deps = pkgs: with pkgs; [
         coreutils
+        findutils
         ncurses
         libnotify mako
         unixtools.getopt
